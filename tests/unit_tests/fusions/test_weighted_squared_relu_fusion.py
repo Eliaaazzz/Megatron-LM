@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu, tanh_soft_clamp
-from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.fusions.fused_weighted_squared_relu import (
+    clamped_squared_relu,
+    weighted_squared_relu_impl,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -169,3 +172,32 @@ def test_squared_relu_fusion_rejects_no_weights_and_no_clamp():
     x = torch.randn(16, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
     with pytest.raises(AssertionError):
         weighted_squared_relu_impl(x, None, None)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("entry_point", ["clamped_squared_relu", "weighted_squared_relu_impl"])
+def test_clamped_squared_relu_follows_each_clamp_scale(entry_point):
+    """Three distinct clamp scales in a row must each clamp at their own scale.
+
+    torch.compile specializes a float argument until the second distinct value and traces one
+    shared graph from then on; a scale baked into that graph shows up on the third value.
+    """
+    torch.manual_seed(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tols = dict(rtol=1.0e-5, atol=1.0e-5)
+    for clamp_scale in (10.0, 5.0, 2.0):
+        x = (torch.randn(16, 64, dtype=torch.float32, device=device) * 5.0).requires_grad_(True)
+        grad_output = torch.randn(16, 64, dtype=torch.float32, device=device)
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        y_ref = torch.pow(torch.relu(clamp_scale * torch.tanh(x_ref / clamp_scale)), 2)
+        y_ref.backward(grad_output)
+
+        if entry_point == "clamped_squared_relu":
+            y = clamped_squared_relu(x, clamp_scale)
+        else:
+            y = weighted_squared_relu_impl(x, None, clamp_scale)
+        y.backward(grad_output)
+
+        assert torch.allclose(y, y_ref, **tols), clamp_scale
+        assert torch.allclose(x.grad, x_ref.grad, **tols), clamp_scale

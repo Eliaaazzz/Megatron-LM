@@ -159,6 +159,38 @@ def test_compiled_activations_replay_bit_exactly(case):
     assert_replays_bit_exact(ACTIVATION_CASES[case], (x,), replays=3, what=case)
 
 
+# Compiled entry points that take a clamp scalar; (input, scalar) -> output.
+SCALAR_CASES = {
+    "clamped_swiglu": lambda x, s: bias_swiglu_impl(x, None, clamp_value=s),
+    "fused_situ_glu": lambda x, s: bias_swiglu_impl(
+        x, None, gate_clamp_scale=s, linear_clamp_scale=s / 2
+    ),
+    "clamped_squared_relu": lambda x, s: weighted_squared_relu_impl(x, None, clamp_scale=s),
+    "tanh_soft_clamp": lambda x, s: activations.tanh_soft_clamp(x, s),
+    "situ": lambda x, s: activations.situ(x, s),
+    "situ_glu": lambda x, s: activations.situ_glu(x, s, s / 2),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SCALAR_CASES))
+def test_compiled_clamps_follow_the_scalar_argument(case):
+    """Each clamp scalar must produce its own output, and a repeated scalar must reproduce its
+    earlier output bit for bit. torch.compile specializes a float argument until the second
+    distinct value and traces a shared graph from then on; a scalar baked into that graph at
+    trace time fails on the third value."""
+    seeded()
+    fn = SCALAR_CASES[case]
+    x = _act((TOKENS, 2 * FFN), grad=True) * 8.0
+    first = fn(x, 7.0)
+    second = fn(x, 10.0)
+    third = fn(x, 3.0)
+    again = fn(x, 7.0)
+    assert not torch.equal(first, second), case
+    assert not torch.equal(second, third), case
+    assert not torch.equal(first, third), case
+    assert torch.equal(first, again), case
+
+
 def test_attention_output_gate_replays_bit_exactly():
     """``Attention._apply_output_gate`` is a compiled method; ``self`` is unused."""
     seeded()

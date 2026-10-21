@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
-from megatron.core.jit import jit_fuser
+from megatron.core.jit import jit_fuser, jit_scalar
 from megatron.core.utils import nvtx_decorator
 
 
@@ -80,9 +80,12 @@ def weighted_swiglu(y, weights):
     return res.to(dtype)
 
 
+# The clamp scalars reach the compiled bodies as 0-d tensors (see jit_scalar); the public
+# functions, and the autograd functions below, keep taking Python floats.
+
+
 @jit_fuser
-def clamped_swiglu(y, clamp_value):
-    """Perform SwiGLU after clamping both halves of the input."""
+def _clamped_swiglu(y, clamp_value: torch.Tensor):
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1 = y_1.clamp(min=None, max=clamp_value)
@@ -91,30 +94,48 @@ def clamped_swiglu(y, clamp_value):
     return res.to(dtype)
 
 
+def clamped_swiglu(y, clamp_value: float):
+    """Perform SwiGLU after clamping both halves of the input."""
+    return _clamped_swiglu(y, jit_scalar(clamp_value, y.device))
+
+
 @jit_fuser
-def bias_clamped_swiglu(y, bias, clamp_value):
+def _bias_clamped_swiglu(y, bias, clamp_value: torch.Tensor):
+    return _clamped_swiglu(y + bias, clamp_value)
+
+
+def bias_clamped_swiglu(y, bias, clamp_value: float):
     """Perform clamped SwiGLU after bias addition."""
-    return clamped_swiglu(y + bias, clamp_value)
+    return _bias_clamped_swiglu(y, bias, jit_scalar(clamp_value, y.device))
 
 
 @jit_fuser
-def clamped_weighted_swiglu(y, weights, clamp_value):
-    """Perform token-weighted clamped SwiGLU."""
+def _clamped_weighted_swiglu(y, weights, clamp_value: torch.Tensor):
     dtype = y.dtype
-    res = clamped_swiglu(y, clamp_value) * weights
+    res = _clamped_swiglu(y, clamp_value) * weights
     return res.to(dtype)
 
 
+def clamped_weighted_swiglu(y, weights, clamp_value: float):
+    """Perform token-weighted clamped SwiGLU."""
+    return _clamped_weighted_swiglu(y, weights, jit_scalar(clamp_value, y.device))
+
+
+def _situ_scales(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    gate = jit_scalar(gate_clamp_scale, y.device)
+    linear = None if linear_clamp_scale is None else jit_scalar(linear_clamp_scale, y.device)
+    return gate, linear
+
+
 @jit_fuser
-def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
+def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: torch.Tensor):
     """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
     t = torch.tanh(y.float() / clamp_scale)
     return clamp_scale * t, 1 - t * t
 
 
 @jit_fuser
-def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
-    """SiTU-GLU: ``s_g * tanh(y1 / s_g) * sigmoid(y1) * y2``, with ``y2`` optionally clamped."""
+def _situ_glu(y, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]):
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y, 2, -1)
     c, _ = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
@@ -124,17 +145,34 @@ def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
     return (gate * y_2).to(dtype)
 
 
+def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    """SiTU-GLU: ``s_g * tanh(y1 / s_g) * sigmoid(y1) * y2``, with ``y2`` optionally clamped."""
+    return _situ_glu(y, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale))
+
+
 @jit_fuser
+def _bias_situ_glu(
+    y, bias, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
+):
+    return _situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
+
+
 def bias_situ_glu(y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
     """Bias addition followed by SiTU-GLU. The clamps act on the full pre-activation."""
-    return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
+    return _bias_situ_glu(y, bias, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale))
 
 
 @jit_fuser
-def weighted_situ_glu(y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+def _weighted_situ_glu(
+    y, weights, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
+):
     dtype = y.dtype
-    res = situ_glu(y, gate_clamp_scale, linear_clamp_scale) * weights
+    res = _situ_glu(y, gate_clamp_scale, linear_clamp_scale) * weights
     return res.to(dtype)
+
+
+def weighted_situ_glu(y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    return _weighted_situ_glu(y, weights, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale))
 
 
 # gradient of tanh approximation of gelu
@@ -187,8 +225,7 @@ def weighted_swiglu_back(g, y, weights):
 
 
 @jit_fuser
-def clamped_swiglu_back(g, y, clamp_value):
-    """Compute the input gradient for clamped SwiGLU."""
+def _clamped_swiglu_back(g, y, clamp_value: torch.Tensor):
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
     y_1c = y_1.clamp(min=None, max=clamp_value)
@@ -213,25 +250,40 @@ def clamped_swiglu_back(g, y, clamp_value):
     return res.to(dtype)
 
 
+def clamped_swiglu_back(g, y, clamp_value: float):
+    """Compute the input gradient for clamped SwiGLU."""
+    return _clamped_swiglu_back(g, y, jit_scalar(clamp_value, y.device))
+
+
 @jit_fuser
-def bias_clamped_swiglu_back(g, y, bias, clamp_value):
+def _bias_clamped_swiglu_back(g, y, bias, clamp_value: torch.Tensor):
+    return _clamped_swiglu_back(g, y + bias, clamp_value)
+
+
+def bias_clamped_swiglu_back(g, y, bias, clamp_value: float):
     """Compute the input gradient for clamped SwiGLU with bias."""
-    return clamped_swiglu_back(g, y + bias, clamp_value)
+    return _bias_clamped_swiglu_back(g, y, bias, jit_scalar(clamp_value, y.device))
 
 
 @jit_fuser
-def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
-    """Compute input and weight gradients for token-weighted clamped SwiGLU."""
+def _clamped_weighted_swiglu_back(g, y, weights, clamp_value: torch.Tensor):
     input_dtype = y.dtype
     w_dtype = weights.dtype
-    input_grad = clamped_swiglu_back(g * weights, y, clamp_value)
-    weights_grad = clamped_swiglu(y, clamp_value) * g.to(w_dtype)
+    input_grad = _clamped_swiglu_back(g * weights, y, clamp_value)
+    weights_grad = _clamped_swiglu(y, clamp_value) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+def clamped_weighted_swiglu_back(g, y, weights, clamp_value: float):
+    """Compute input and weight gradients for token-weighted clamped SwiGLU."""
+    return _clamped_weighted_swiglu_back(g, y, weights, jit_scalar(clamp_value, y.device))
+
+
 @jit_fuser
-def _situ_glu_grads(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+def _situ_glu_grads(
+    g, y, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
+):
     """Gradients of SiTU-GLU w.r.t. the two halves of ``y``, kept in fp32."""
     y_1, y_2 = torch.chunk(y, 2, -1)
     c, sech2 = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
@@ -248,29 +300,49 @@ def _situ_glu_grads(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[
 
 
 @jit_fuser
-def situ_glu_back(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+def _situ_glu_back(
+    g, y, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
+):
     input_dtype = y.dtype
     dy_1, dy_2 = _situ_glu_grads(g, y, gate_clamp_scale, linear_clamp_scale)
     return torch.cat((dy_1, dy_2), -1).to(input_dtype)
 
 
+def situ_glu_back(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
+    return _situ_glu_back(g, y, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale))
+
+
 @jit_fuser
+def _bias_situ_glu_back(
+    g, y, bias, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
+):
+    return _situ_glu_back(g, y + bias, gate_clamp_scale, linear_clamp_scale)
+
+
 def bias_situ_glu_back(g, y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
-    return situ_glu_back(g, y + bias, gate_clamp_scale, linear_clamp_scale)
+    return _bias_situ_glu_back(g, y, bias, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale))
 
 
 @jit_fuser
-def weighted_situ_glu_back(
-    g, y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]
+def _weighted_situ_glu_back(
+    g, y, weights, gate_clamp_scale: torch.Tensor, linear_clamp_scale: Optional[torch.Tensor]
 ):
     input_dtype = y.dtype
     w_dtype = weights.dtype
     dy_1, dy_2 = _situ_glu_grads(g * weights, y, gate_clamp_scale, linear_clamp_scale)
     input_grad = torch.cat((dy_1, dy_2), -1)
     # precison of w may be higher than y and g, so we need to cast g to w_dtype
-    weights_grad = situ_glu(y, gate_clamp_scale, linear_clamp_scale) * g.to(w_dtype)
+    weights_grad = _situ_glu(y, gate_clamp_scale, linear_clamp_scale) * g.to(w_dtype)
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
+def weighted_situ_glu_back(
+    g, y, weights, gate_clamp_scale: float, linear_clamp_scale: Optional[float]
+):
+    return _weighted_situ_glu_back(
+        g, y, weights, *_situ_scales(y, gate_clamp_scale, linear_clamp_scale)
+    )
 
 
 class BiasSwiGLUFunction(torch.autograd.Function):

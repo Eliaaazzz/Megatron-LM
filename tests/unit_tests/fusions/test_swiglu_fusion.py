@@ -5,7 +5,15 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    bias_clamped_swiglu,
+    bias_swiglu_impl,
+    clamped_swiglu,
+    clamped_swiglu_back,
+    clamped_weighted_swiglu,
+)
+from megatron.core.fusions.fused_bias_swiglu import situ_glu as fused_situ_glu
+from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -249,3 +257,98 @@ def test_bias_swiglu_impl_clamp_none_matches_unclamped(input_dtype, with_bias):
             bias_explicit.grad.flatten().float().unsqueeze(0),
         ).item()
         assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
+
+
+# --- the clamp scalars must not be baked into the compiled kernels ------------------------
+#
+# torch.compile specializes a Python float argument until it sees a second distinct value and
+# traces one shared graph from then on; a bound baked into that graph at trace time shows up
+# on the third distinct value. These run on CPU as well as GPU.
+
+
+def _device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _reference_clamped_swiglu(x, clamp_value):
+    y_1, y_2 = torch.chunk(x.float(), 2, -1)
+    return (F.silu(y_1.clamp(max=clamp_value)) * y_2.clamp(-clamp_value, clamp_value)).to(x.dtype)
+
+
+def _reference_situ_glu(x, gate_clamp_scale, linear_clamp_scale):
+    x_gate, x_linear = torch.chunk(x.float(), 2, -1)
+    gate = gate_clamp_scale * torch.tanh(x_gate / gate_clamp_scale) * torch.sigmoid(x_gate)
+    if linear_clamp_scale is not None:
+        x_linear = linear_clamp_scale * torch.tanh(x_linear / linear_clamp_scale)
+    return (gate * x_linear).to(x.dtype)
+
+
+def _assert_matches_reference(fused_fn, reference_fn, scalars, scale=8.0):
+    torch.manual_seed(0)
+    tols = dict(rtol=1.0e-5, atol=1.0e-5)
+    for scalar in scalars:
+        x = (torch.randn(16, 64, dtype=torch.float32, device=_device()) * scale).requires_grad_(
+            True
+        )
+        grad_output = torch.randn(16, 32, dtype=torch.float32, device=_device())
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        y_ref = reference_fn(x_ref, scalar)
+        y_ref.backward(grad_output)
+
+        y = fused_fn(x, scalar)
+        y.backward(grad_output)
+
+        assert torch.allclose(y, y_ref, **tols), scalar
+        assert torch.allclose(x.grad, x_ref.grad, **tols), scalar
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    ["clamped_swiglu", "bias_clamped_swiglu", "clamped_weighted_swiglu", "bias_swiglu_impl"],
+)
+def test_clamped_swiglu_follows_each_clamp_value(entry_point):
+    """Three distinct clamp values in a row must each clamp at their own value, through the
+    compiled helpers called directly (autograd through the compiled graph) and through the
+    autograd function."""
+    device = _device()
+    if entry_point == "clamped_swiglu":
+        fused = lambda x, cv: clamped_swiglu(x, cv)
+        reference = _reference_clamped_swiglu
+    elif entry_point == "bias_clamped_swiglu":
+        bias = torch.randn(64, dtype=torch.float32, device=device)
+        fused = lambda x, cv: bias_clamped_swiglu(x, bias, cv)
+        reference = lambda x, cv: _reference_clamped_swiglu(x + bias, cv)
+    elif entry_point == "clamped_weighted_swiglu":
+        weights = torch.rand(16, 1, dtype=torch.float32, device=device) + 0.5
+        fused = lambda x, cv: clamped_weighted_swiglu(x, weights, cv)
+        reference = lambda x, cv: _reference_clamped_swiglu(x, cv) * weights
+    else:
+        fused = lambda x, cv: bias_swiglu_impl(x, None, clamp_value=cv)
+        reference = _reference_clamped_swiglu
+    _assert_matches_reference(fused, reference, (5.0, 10.0, 2.0))
+
+
+def test_clamped_swiglu_back_follows_each_clamp_value():
+    """The explicit backward helper, called directly as the autograd functions do."""
+    torch.manual_seed(0)
+    for clamp_value in (5.0, 10.0, 2.0):
+        x = (torch.randn(16, 64, dtype=torch.float32, device=_device()) * 8.0).requires_grad_(True)
+        grad_output = torch.randn(16, 32, dtype=torch.float32, device=_device())
+        (reference,) = torch.autograd.grad(
+            _reference_clamped_swiglu(x, clamp_value), x, grad_output
+        )
+        fused = clamped_swiglu_back(grad_output, x.detach(), clamp_value)
+        assert torch.allclose(fused, reference, rtol=1.0e-5, atol=1.0e-5), clamp_value
+
+
+@pytest.mark.parametrize("entry_point", ["situ_glu", "bias_swiglu_impl"])
+def test_situ_glu_follows_each_clamp_scale(entry_point):
+    """Same contract for the soft-clamp scales."""
+    if entry_point == "situ_glu":
+        fused = lambda x, s: fused_situ_glu(x, s, s / 2)
+    else:
+        fused = lambda x, s: bias_swiglu_impl(x, None, gate_clamp_scale=s, linear_clamp_scale=s / 2)
+    _assert_matches_reference(
+        fused, lambda x, s: _reference_situ_glu(x, s, s / 2), (5.0, 10.0, 2.0), scale=5.0
+    )

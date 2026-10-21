@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
-from megatron.core.jit import jit_fuser
+from megatron.core.jit import jit_fuser, jit_scalar
 from megatron.core.utils import nvtx_decorator
 
 ######################  WEIGHTED SQUARED ReLU FUSION  ######################
@@ -59,13 +59,26 @@ def weighted_squared_relu_back(g: torch.Tensor, x: torch.Tensor, weights: torch.
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+# The clamp scale reaches the compiled bodies as a 0-d tensor (see jit_scalar); the public
+# functions, and the autograd function below, keep taking a Python float.
+
+
 @jit_fuser
-def _tanh_relu_over_scale(x: torch.Tensor, clamp_scale: float) -> torch.Tensor:
+def _tanh_relu_over_scale(x: torch.Tensor, clamp_scale: torch.Tensor) -> torch.Tensor:
     """``tanh(ReLU(x) / clamp_scale)`` in fp32, the shared term of the clamped forward/backward."""
     return torch.tanh(F.relu(x.float()) / clamp_scale)
 
 
 @jit_fuser
+def _weighted_clamped_squared_relu(
+    x: torch.Tensor, weights: torch.Tensor, clamp_scale: torch.Tensor
+) -> torch.Tensor:
+    out_dtype = x.dtype
+    c = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
+    res = torch.pow(c, 2) * weights
+    return res.to(out_dtype)
+
+
 def weighted_clamped_squared_relu(
     x: torch.Tensor, weights: torch.Tensor, clamp_scale: float
 ) -> torch.Tensor:
@@ -80,20 +93,13 @@ def weighted_clamped_squared_relu(
     Returns:
         torch.Tensor: The weighted activation with original ``dtype`` preserved.
     """
-    out_dtype = x.dtype
-    c = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
-    res = torch.pow(c, 2) * weights
-    return res.to(out_dtype)
+    return _weighted_clamped_squared_relu(x, weights, jit_scalar(clamp_scale, x.device))
 
 
 @jit_fuser
-def weighted_clamped_squared_relu_back(
-    g: torch.Tensor, x: torch.Tensor, weights: torch.Tensor, clamp_scale: float
+def _weighted_clamped_squared_relu_back(
+    g: torch.Tensor, x: torch.Tensor, weights: torch.Tensor, clamp_scale: torch.Tensor
 ):
-    """Backward for weighted tanh soft-clamped Squared-ReLU.
-
-    Returns gradients w.r.t ``x`` and ``weights``.
-    """
     input_dtype = x.dtype
     w_dtype = weights.dtype
 
@@ -110,7 +116,23 @@ def weighted_clamped_squared_relu_back(
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+def weighted_clamped_squared_relu_back(
+    g: torch.Tensor, x: torch.Tensor, weights: torch.Tensor, clamp_scale: float
+):
+    """Backward for weighted tanh soft-clamped Squared-ReLU.
+
+    Returns gradients w.r.t ``x`` and ``weights``.
+    """
+    return _weighted_clamped_squared_relu_back(g, x, weights, jit_scalar(clamp_scale, x.device))
+
+
 @jit_fuser
+def _clamped_squared_relu(x: torch.Tensor, clamp_scale: torch.Tensor) -> torch.Tensor:
+    out_dtype = x.dtype
+    clamped = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
+    return torch.pow(clamped, 2).to(out_dtype)
+
+
 def clamped_squared_relu(x: torch.Tensor, clamp_scale: float) -> torch.Tensor:
     """Tanh-soft-clamped squared-ReLU without token weights.
 
@@ -118,18 +140,20 @@ def clamped_squared_relu(x: torch.Tensor, clamp_scale: float) -> torch.Tensor:
     pre-activation and the square stay in FP32 and only the result is rounded back to
     the input dtype.
     """
-    out_dtype = x.dtype
-    clamped = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
-    return torch.pow(clamped, 2).to(out_dtype)
+    return _clamped_squared_relu(x, jit_scalar(clamp_scale, x.device))
 
 
 @jit_fuser
-def clamped_squared_relu_back(g: torch.Tensor, x: torch.Tensor, clamp_scale: float):
-    """Backward for tanh-soft-clamped squared-ReLU, recomputed from the raw input."""
+def _clamped_squared_relu_back(g: torch.Tensor, x: torch.Tensor, clamp_scale: torch.Tensor):
     tanh_value = _tanh_relu_over_scale(x, clamp_scale)
     clamped = clamp_scale * tanh_value
     input_grad = (1 - torch.pow(tanh_value, 2)) * (2 * clamped) * g
     return input_grad.to(x.dtype)
+
+
+def clamped_squared_relu_back(g: torch.Tensor, x: torch.Tensor, clamp_scale: float):
+    """Backward for tanh-soft-clamped squared-ReLU, recomputed from the raw input."""
+    return _clamped_squared_relu_back(g, x, jit_scalar(clamp_scale, x.device))
 
 
 class WeightedSquaredReLUFunction(torch.autograd.Function):
